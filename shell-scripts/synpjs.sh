@@ -18,34 +18,66 @@
 #      - macOS: brew install jq
 #      - Ubuntu / Debian / WSL: sudo apt install jq
 #
+# 【外部設定檔格式說明】
+#   每行填入一個項目，支援以 # 開頭的註解行與空白行。
+#   - 專案清單檔 (預設 repos.txt)：填寫本地專案目錄路徑
+#       例如：
+#       ./org_repos/MyOrg/pos
+#       ./org_repos/MyOrg/scm-api
+#   - 組織清單檔 (預設 orgs.txt)：填寫 GitHub Organization 名稱
+#       例如：
+#       company-backend
+#       company-frontend
+#
 # 【使用方式】
 #   1. 給予執行權限：
 #      chmod +x sync_repos.sh
 #
-#   2. 模式 A：指定同步一個或多個專案資料夾
-#      ./sync_repos.sh ./org_repos/MyOrg/pos
-#      ./sync_repos.sh ./org_repos/MyOrg/pos ./org_repos/MyOrg/scm-api
-#      ./sync_repos.sh ./org_repos/MyOrg/scm-*
+#   2. 模式 A：指定專案同步（優先級高於組織同步）
+#      - 直接由 CLI 參數指定資料夾：
+#          ./sync_repos.sh ./org_repos/MyOrg/pos ./org_repos/MyOrg/scm-*
+#      - 或是建立 repos.txt，執行腳本時若有清單內容將自動讀取同步：
+#          ./sync_repos.sh
 #
-#   3. 模式 B：全自動同步（不帶參數）
-#      ./sync_repos.sh
-#      - 若下方 TARGET_ORGS 有指定，則只同步指定的組織。
-#      - 若下方 TARGET_ORGS 為空，則自動抓取當前帳號所屬的全部組織。
+#   3. 模式 B：組織批量同步（無指定專案時觸發）
+#      - 若 orgs.txt 存在且有內容，則同步檔案內指定的組織。
+#      - 若 orgs.txt 不存在或為空，則自動透過 GitHub API 抓取帳號所屬的全部組織。
+#          ./sync_repos.sh
 #
 # ==============================================================================
 
 set -eu
 
 # ==============================================================================
-# 設定區
+# 外部文字檔路徑設定
 # ==============================================================================
-# 若無傳入特定專案參數時生效：
-# 可在此指定組織名稱，例如：TARGET_ORGS=("org-a" "org-b")
-# 若為空 TARGET_ORGS=()，則自動抓取所屬全部組織
-TARGET_ORGS=()
+# 指定專案清單檔案路徑（一行一個專案路徑）
+REPOS_FILE="repos.txt"
+
+# 指定組織清單檔案路徑（一行一個組織名稱）
+ORGS_FILE="orgs.txt"
 
 # 組織同步時的預設存放根目錄
 DEFAULT_ROOT_DIR="./org_repos"
+
+# ==============================================================================
+# 輔助函式：自外部檔案讀取非空白且非註解的項目至陣列
+# ==============================================================================
+read_lines_from_file() {
+    local file_path="$1"
+    local -n out_array="$2"
+
+    if [ -f "$file_path" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            # 去除前後空白
+            line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            # 略過空白行與 # 開頭的註解
+            if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
+                out_array+=("$line")
+            fi
+        done < "$file_path"
+    fi
+}
 
 # ==============================================================================
 # 輔助函式：同步單一專案 (Pull)
@@ -70,15 +102,24 @@ sync_single_repo() {
 }
 
 # ==============================================================================
-# 模式 A：給定一個或多個專案資料夾路徑
+# 模式 A：指定專案同步（檢查 CLI 參數或 REPOS_FILE）
 # ==============================================================================
+TARGET_REPOS=()
+
+# 優先讀取指令列參數
 if [ "$#" -gt 0 ]; then
+    TARGET_REPOS=("$@")
+elif [ -f "$REPOS_FILE" ]; then
+    read_lines_from_file "$REPOS_FILE" TARGET_REPOS
+fi
+
+# 若有指定專案（無論來自參數或檔案），直接執行單一專案同步並結束
+if [ ${#TARGET_REPOS[@]} -gt 0 ]; then
     echo "=================================================="
-    echo "檢測到指定專案參數，僅針對指定資料夾進行同步"
+    echo "檢測到指定專案清單，僅針對指定資料夾進行同步"
     echo "=================================================="
 
-    for repo_arg in "$@"; do
-        # 移除路徑尾端多餘的斜線
+    for repo_arg in "${TARGET_REPOS[@]}"; do
         repo_clean="${repo_arg%/}"
         sync_single_repo "$repo_clean"
     done
@@ -89,21 +130,24 @@ if [ "$#" -gt 0 ]; then
 fi
 
 # ==============================================================================
-# 模式 B：未傳入專案參數，執行組織批量同步
+# 模式 B：組織批量同步（從 ORGS_FILE 或 GitHub API 取得）
 # ==============================================================================
 TARGET_DIR="$DEFAULT_ROOT_DIR"
 mkdir -p "$TARGET_DIR"
 
 ORGS=()
 
-if [ ${#TARGET_ORGS[@]} -eq 0 ]; then
-    echo "==> 未指定專案與 TARGET_ORGS，正在自動獲取所屬的所有 GitHub 組織..."
+if [ -f "$ORGS_FILE" ]; then
+    read_lines_from_file "$ORGS_FILE" ORGS
+fi
+
+if [ ${#ORGS[@]} -eq 0 ]; then
+    echo "==> 未指定專案且 $ORGS_FILE 為空或不存在，自動獲取所屬的所有 GitHub 組織..."
     while IFS= read -r org_line; do
         [ -n "$org_line" ] && ORGS+=("$org_line")
     done < <(gh api user/orgs --paginate -q '.[].login' 2>/dev/null || true)
 else
-    echo "==> 使用自訂組織陣列清單..."
-    ORGS=("${TARGET_ORGS[@]}")
+    echo "==> 自 $ORGS_FILE 載入指定組織清單..."
 fi
 
 if [ ${#ORGS[@]} -eq 0 ]; then
