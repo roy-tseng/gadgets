@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# GitHub Repositories 同步工具 (支援 Bash 與 macOS zsh)
+# GitHub Repositories 同步工具 (支援 Bash 3.2+、Bash 4+ 與 macOS zsh)
 # ==============================================================================
 #
 # 【前置需求】
@@ -31,18 +31,18 @@
 #
 # 【使用方式】
 #   1. 給予執行權限：
-#      chmod +x sync_repos.sh
+#      chmod +x synpjs.sh
 #
 #   2. 模式 A：指定專案同步（優先級高於組織同步）
 #      - 直接由 CLI 參數指定資料夾：
-#          ./sync_repos.sh ./org_repos/MyOrg/pos ./org_repos/MyOrg/scm-*
+#          ./synpjs.sh ./org_repos/MyOrg/pos ./org_repos/MyOrg/scm-*
 #      - 或是建立 repos.txt，執行腳本時若有清單內容將自動讀取同步：
-#          ./sync_repos.sh
+#          ./synpjs.sh
 #
 #   3. 模式 B：組織批量同步（無指定專案時觸發）
 #      - 若 orgs.txt 存在且有內容，則同步檔案內指定的組織。
 #      - 若 orgs.txt 不存在或為空，則自動透過 GitHub API 抓取帳號所屬的全部組織。
-#          ./sync_repos.sh
+#          ./synpjs.sh
 #
 # ==============================================================================
 
@@ -61,19 +61,18 @@ ORGS_FILE="orgs.txt"
 DEFAULT_ROOT_DIR="./org_repos"
 
 # ==============================================================================
-# 輔助函式：自外部檔案讀取非空白且非註解的項目至陣列
+# 輔助函式：自外部檔案讀取非空白且非註解的項目（相容所有 Bash/zsh 版本）
 # ==============================================================================
-read_lines_from_file() {
+read_valid_lines() {
     local file_path="$1"
-    local -n out_array="$2"
 
     if [ -f "$file_path" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
             # 去除前後空白
-            line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
+            line=$(echo "$line" \vert{} sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             # 略過空白行與 # 開頭的註解
             if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
-                out_array+=("$line")
+                echo "$line"
             fi
         done < "$file_path"
     fi
@@ -82,109 +81,3 @@ read_lines_from_file() {
 # ==============================================================================
 # 輔助函式：同步單一專案 (Pull)
 # ==============================================================================
-sync_single_repo() {
-    local target_path="$1"
-
-    if [ ! -d "$target_path" ]; then
-        echo "❌ [錯誤] 目錄不存在: $target_path"
-        return 1
-    fi
-
-    if [ ! -d "$target_path/.git" ]; then
-        echo "⚠️  [跳過] 目錄不是有效的 Git 儲存庫: $target_path"
-        return 0
-    fi
-
-    echo "--> [PULL] 更新專案: $target_path..."
-    git -C "$target_path" pull --ff-only || {
-        echo "⚠️  [警告] $target_path pull 失敗（可能存在分支分歧或未提交改動），略過。"
-    }
-}
-
-# ==============================================================================
-# 模式 A：指定專案同步（檢查 CLI 參數或 REPOS_FILE）
-# ==============================================================================
-TARGET_REPOS=()
-
-# 優先讀取指令列參數
-if [ "$#" -gt 0 ]; then
-    TARGET_REPOS=("$@")
-elif [ -f "$REPOS_FILE" ]; then
-    read_lines_from_file "$REPOS_FILE" TARGET_REPOS
-fi
-
-# 若有指定專案（無論來自參數或檔案），直接執行單一專案同步並結束
-if [ ${#TARGET_REPOS[@]} -gt 0 ]; then
-    echo "=================================================="
-    echo "檢測到指定專案清單，僅針對指定資料夾進行同步"
-    echo "=================================================="
-
-    for repo_arg in "${TARGET_REPOS[@]}"; do
-        repo_clean="${repo_arg%/}"
-        sync_single_repo "$repo_clean"
-    done
-
-    echo "=================================================="
-    echo "指定專案同步完成！"
-    exit 0
-fi
-
-# ==============================================================================
-# 模式 B：組織批量同步（從 ORGS_FILE 或 GitHub API 取得）
-# ==============================================================================
-TARGET_DIR="$DEFAULT_ROOT_DIR"
-mkdir -p "$TARGET_DIR"
-
-ORGS=()
-
-if [ -f "$ORGS_FILE" ]; then
-    read_lines_from_file "$ORGS_FILE" ORGS
-fi
-
-if [ ${#ORGS[@]} -eq 0 ]; then
-    echo "==> 未指定專案且 $ORGS_FILE 為空或不存在，自動獲取所屬的所有 GitHub 組織..."
-    while IFS= read -r org_line; do
-        [ -n "$org_line" ] && ORGS+=("$org_line")
-    done < <(gh api user/orgs --paginate -q '.[].login' 2>/dev/null || true)
-else
-    echo "==> 自 $ORGS_FILE 載入指定組織清單..."
-fi
-
-if [ ${#ORGS[@]} -eq 0 ]; then
-    echo "未找到任何組織或權限不足。"
-    exit 0
-fi
-
-for ORG in "${ORGS[@]}"; do
-    [ -z "$ORG" ] && continue
-
-    echo "=================================================="
-    echo "正在處理組織: $ORG"
-    echo "=================================================="
-
-    ORG_DIR="$TARGET_DIR/$ORG"
-    mkdir -p "$ORG_DIR"
-
-    REPOS=$(gh repo list "$ORG" --limit 1000 --json name,sshUrl,isArchived \
-        --jq '.[] | select(.isArchived == false) | "\(.name) \(.sshUrl)"' 2>/dev/null || true)
-
-    if [ -z "$REPOS" ]; then
-        echo "[$ORG] 沒有活躍的儲存庫或無權限存取。"
-        continue
-    fi
-
-    while IFS=' ' read -r REPO_NAME REPO_URL; do
-        [ -z "$REPO_NAME" ] && continue
-        REPO_PATH="$ORG_DIR/$REPO_NAME"
-
-        if [ -d "$REPO_PATH/.git" ]; then
-            sync_single_repo "$REPO_PATH"
-        else
-            echo "--> [CLONE] 下載 $ORG/$REPO_NAME..."
-            git clone "$REPO_URL" "$REPO_PATH"
-        fi
-    done <<< "$REPOS"
-done
-
-echo "=================================================="
-echo "所有組織儲存庫同步完成！目錄位於: $TARGET_DIR"
