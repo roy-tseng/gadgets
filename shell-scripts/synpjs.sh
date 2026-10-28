@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# GitHub Repositories 同步工具 (支援 Bash 3.2+、Bash 4+ 與 macOS zsh)
+# GitHub Repositories 同步工具 (支援併行加速、Bash 3.2+、Bash 4+ 與 macOS zsh)
 # ==============================================================================
 #
 # 【前置需求】
@@ -18,59 +18,51 @@
 #      - macOS: brew install jq
 #      - Ubuntu / Debian / WSL: sudo apt install jq
 #
-# 【外部設定檔格式說明】
-#   每行填入一個項目，支援以 # 開頭的註解行與空白行。
-#   - 專案清單檔 (預設 repos.txt)：填寫本地專案目錄路徑
-#       例如：
-#       ./org_repos/MyOrg/pos
-#       ./org_repos/MyOrg/scm-api
-#   - 組織清單檔 (預設 orgs.txt)：填寫 GitHub Organization 名稱
-#       例如：
-#       company-backend
-#       company-frontend
-#
 # 【使用方式】
 #   1. 給予執行權限：
 #      chmod +x synpjs.sh
 #
-#   2. 模式 A：指定專案同步（優先級高於組織同步）
-#      - 直接由 CLI 參數指定資料夾：
-#          ./synpjs.sh ./org_repos/MyOrg/pos ./org_repos/MyOrg/scm-*
-#      - 或是建立 repos.txt，執行腳本時若有清單內容將自動讀取同步：
-#          ./synpjs.sh
+#   2. 模式 A：指定專案同步（支援併行）
+#      ./synpjs.sh ./org_repos/MyOrg/pos ./org_repos/MyOrg/scm-*
+#      或是由 repos.txt 自動載入路徑後併行同步。
 #
-#   3. 模式 B：組織批量同步（無指定專案時觸發）
-#      - 若 orgs.txt 存在且有內容，則同步檔案內指定的組織。
-#      - 若 orgs.txt 不存在或為空，則自動透過 GitHub API 抓取帳號所屬的全部組織。
-#          ./synpjs.sh
+#   3. 模式 B：組織批量同步（支援併行）
+#      ./synpjs.sh
 #
 # ==============================================================================
 
 set -eu
 
 # ==============================================================================
-# 外部文字檔路徑設定
+# 設定區
 # ==============================================================================
-# 指定專案清單檔案路徑（一行一個專案路徑）
+MAX_JOBS=6
 REPOS_FILE="repos.txt"
-
-# 指定組織清單檔案路徑（一行一個組織名稱）
 ORGS_FILE="orgs.txt"
+DEFAULT_ROOT_DIR="${DEFAULT_ROOT_DIR:-./org_repos}"
 
-# 組織同步時的預設存放根目錄
-DEFAULT_ROOT_DIR=""
+# 用於跨子行程彙整 Summary 的臨時檔
+SUMMARY_LOG=$(mktemp /tmp/synpjs_summary.XXXXXX)
+trap 'rm -f "$SUMMARY_LOG"' EXIT
 
 # ==============================================================================
-# 輔助函式：自外部檔案讀取非空白且非註解的項目（相容所有 Bash/zsh 版本）
+# 輔助函式：併行工作節流控制器
+# ==============================================================================
+wait_for_job_slot() {
+    while [ "$(jobs -p | wc -l)" -ge "$MAX_JOBS" ]; do
+        sleep 0.2
+    done
+}
+
+# ==============================================================================
+# 輔助函式：自外部檔案讀取非空白且非註解的項目
 # ==============================================================================
 read_valid_lines() {
     local file_path="$1"
 
     if [ -f "$file_path" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
-            # 去除前後空白
             line=$(echo "$line" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            # 略過空白行與 # 開頭的註解
             if [ -n "$line" ] && [[ ! "$line" =~ ^# ]]; then
                 echo "$line"
             fi
@@ -79,10 +71,47 @@ read_valid_lines() {
 }
 
 # ==============================================================================
+# 輔助函式：取得目錄的完整絕對路徑 (Full Path)
+# ==============================================================================
+get_full_path() {
+    local target_dir="$1"
+    if [ -d "$target_dir" ]; then
+        (cd "$target_dir" && pwd -P)
+    else
+        echo "$target_dir"
+    fi
+}
+
+# ==============================================================================
+# 輔助函式：記錄結果至 Summary 檔案
+# ==============================================================================
+record_summary() {
+    local org="$1"
+    local repo="$2"
+    local path="$3"
+
+    local branch="-"
+    local full_path
+    full_path=$(get_full_path "$path")
+
+    if [ -d "$path/.git" ]; then
+        branch=$(git -C "$path" branch --show-current 2>/dev/null || echo "DETACHED")
+        [ -z "$branch" ] && branch="DETACHED"
+    fi
+
+    # 寫入格式：Org|Repo|Branch|FullPath
+    echo "${org}|${repo}|${branch}|${full_path}" >> "$SUMMARY_LOG"
+}
+
+# ==============================================================================
 # 輔助函式：同步單一專案 (Pull)
 # ==============================================================================
 sync_single_repo() {
     local target_path="$1"
+    local org="-"
+    local repo_name
+
+    repo_name=$(basename "$target_path")
 
     if [ ! -d "$target_path" ]; then
         echo "❌ [錯誤] 目錄不存在: $target_path"
@@ -94,10 +123,78 @@ sync_single_repo() {
         return 0
     fi
 
+    # 嘗試從 Git remote URL 解析組織名稱
+    local remote_url
+    remote_url=$(git -C "$target_path" remote get-url origin 2>/dev/null || true)
+    if [[ "$remote_url" =~ [:|/]([^/]+)/[^/]+(\.git)?$ ]]; then
+        org="${BASH_REMATCH[1]}"
+    fi
+
     echo "--> [PULL] 更新專案: $target_path..."
-    git -C "$target_path" pull --ff-only || {
+    if ! git -C "$target_path" pull --ff-only >/dev/null 2>&1; then
         echo "⚠️  [警告] $target_path pull 失敗（可能存在分支分歧或未提交改動），略過。"
+    else
+        echo "✅ [完成] $target_path 更新完畢。"
+    fi
+
+    record_summary "$org" "$repo_name" "$target_path"
+}
+
+# ==============================================================================
+# 輔助函式：處理單一儲存庫 Clone 或 Pull
+# ==============================================================================
+process_repo() {
+    local org_name="$1"
+    local repo_name="$2"
+    local repo_url="$3"
+    local repo_path="$4"
+
+    if [ -d "$repo_path/.git" ]; then
+        echo "--> [PULL] 更新專案: $org_name/$repo_name..."
+        if ! git -C "$repo_path" pull --ff-only >/dev/null 2>&1; then
+            echo "⚠️  [警告] $org_name/$repo_name pull 失敗，略過。"
+        else
+            echo "✅ [完成] $org_name/$repo_name 更新完畢。"
+        fi
+    else
+        echo "--> [CLONE] 下載 $org_name/$repo_name..."
+        if git clone "$repo_url" "$repo_path" >/dev/null 2>&1; then
+            echo "✅ [完成] $org_name/$repo_name 下載完成。"
+        else
+            echo "❌ [失敗] $org_name/$repo_name clone 失敗。"
+            return 1
+        fi
+    fi
+
+    record_summary "$org_name" "$repo_name" "$repo_path"
+}
+
+# ==============================================================================
+# 輔助函式：列印 Summary 表格
+# ==============================================================================
+print_summary_table() {
+    echo ""
+    echo "================================================================================================================"
+    echo "                                            同步結果總覽 (SUMMARY)                                              "
+    echo "================================================================================================================"
+
+    if [ ! -s "$SUMMARY_LOG" ]; then
+        echo "沒有可顯示的同步紀錄。"
+        return 0
+    fi
+
+    # 輸出對齊格式的表格
+    awk -F'|' '
+    BEGIN {
+        printf "%-18s | %-22s | %-16s | %s\n", "組織 (Organization)", "專案名 (Repository)", "分支 (Branch)", "完整路徑 (Full Path)"
+        print "----------------------------------------------------------------------------------------------------------------"
     }
+    {
+        printf "%-18s | %-22s | %-16s | %s\n", $1, $2, $3, $4
+    }
+    ' "$SUMMARY_LOG"
+
+    echo "================================================================================================================"
 }
 
 # ==============================================================================
@@ -105,7 +202,6 @@ sync_single_repo() {
 # ==============================================================================
 TARGET_REPOS=()
 
-# 優先讀取指令列參數
 if [ "$#" -gt 0 ]; then
     TARGET_REPOS=("$@")
 elif [ -f "$REPOS_FILE" ]; then
@@ -114,24 +210,24 @@ elif [ -f "$REPOS_FILE" ]; then
     done < <(read_valid_lines "$REPOS_FILE")
 fi
 
-# 若有指定專案（無論來自參數或檔案），直接執行單一專案同步並結束
 if [ ${#TARGET_REPOS[@]} -gt 0 ]; then
     echo "=================================================="
-    echo "檢測到指定專案清單，僅針對指定資料夾進行同步"
+    echo "檢測到指定專案清單，以併行方式 (最大 ${MAX_JOBS} 個) 進行同步"
     echo "=================================================="
 
     for repo_arg in "${TARGET_REPOS[@]}"; do
         repo_clean="${repo_arg%/}"
-        sync_single_repo "$repo_clean"
+        wait_for_job_slot
+        ( sync_single_repo "$repo_clean" ) &
     done
 
-    echo "=================================================="
-    echo "指定專案同步完成！"
+    wait
+    print_summary_table
     exit 0
 fi
 
 # ==============================================================================
-# 模式 B：組織批量同步（從 ORGS_FILE 或 GitHub API 取得）
+# 模式 B：組織批量同步
 # ==============================================================================
 TARGET_DIR="$DEFAULT_ROOT_DIR"
 mkdir -p "$TARGET_DIR"
@@ -162,7 +258,7 @@ for ORG in "${ORGS[@]}"; do
     [ -z "$ORG" ] && continue
 
     echo "=================================================="
-    echo "正在處理組織: $ORG"
+    echo "正在處理組織: $ORG (併行數上限: $MAX_JOBS)"
     echo "=================================================="
 
     ORG_DIR="$TARGET_DIR/$ORG"
@@ -180,14 +276,11 @@ for ORG in "${ORGS[@]}"; do
         [ -z "$REPO_NAME" ] && continue
         REPO_PATH="$ORG_DIR/$REPO_NAME"
 
-        if [ -d "$REPO_PATH/.git" ]; then
-            sync_single_repo "$REPO_PATH"
-        else
-            echo "--> [CLONE] 下載 $ORG/$REPO_NAME..."
-            git clone "$REPO_URL" "$REPO_PATH"
-        fi
+        wait_for_job_slot
+        ( process_repo "$ORG" "$REPO_NAME" "$REPO_URL" "$REPO_PATH" ) &
     done <<< "$REPOS"
+
+    wait
 done
 
-echo "=================================================="
-echo "所有組織儲存庫同步完成！目錄位於: $TARGET_DIR"
+print_summary_table
